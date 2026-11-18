@@ -1,0 +1,383 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  r1 safe baseline - internal ALB -> ECS(EC2 g6.xlarge x8) task = HAProxy admission sidecar + reference inference.
+  Fixed fleet at the GPU cap (8) because peak demand exceeds 8 GPUs at every stage from 2 upward;
+  the sidecar bounds per-GPU queueing so overload never turns into a backlog collapse.
+
+Parameters:
+  # ---- platform parameters (passed by the exam) ----
+  VpcId: {Type: "AWS::EC2::VPC::Id"}
+  SubnetIds: {Type: "List<AWS::EC2::Subnet::Id>"}
+  ClientSecurityGroupId: {Type: "AWS::EC2::SecurityGroup::Id"}
+  EndpointSecurityGroupId: {Type: "AWS::EC2::SecurityGroup::Id"}
+  S3PrefixListId: {Type: String}
+  RunId: {Type: String}
+  TaskExecutionRoleArn: {Type: String}
+  InstanceProfileArn: {Type: String}
+  ReferenceImageUri: {Type: String}
+  EcsGpuAmiId: {Type: "AWS::EC2::Image::Id"}
+  ImageHaproxy: {Type: String}
+  # ---- tuning knobs (defaults are the submitted values) ----
+  GpuCount:
+    Type: Number
+    Default: 8
+    Description: GPU hosts = inference tasks (1 GPU per task). Exam cap is 8.
+  BackendMaxConn:
+    Type: Number
+    Default: 2
+    Description: Requests in flight to the inference container (1 running + 1 ready).
+  QueueTimeoutMs:
+    Type: Number
+    Default: 1000
+    Description: Max wait in the sidecar queue before a fast 503 (keeps total latency far below the 10 s limit).
+
+Resources:
+  # ───────────── Security groups: client -> ALB(80) -> sidecar(8081). Hosts reach AWS endpoints only ─────────────
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "exam-r${RunId}-alb"
+      GroupDescription: entry - internal ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ClientSecurityGroupId}
+  ServiceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "exam-r${RunId}-service"
+      GroupDescription: inference tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - {IpProtocol: "-1", CidrIp: 127.0.0.1/32}
+  HostSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "exam-r${RunId}-host"
+      GroupDescription: GPU hosts - AWS endpoints only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref EndpointSecurityGroupId}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId}
+  AlbToService:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8081
+      DestinationSecurityGroupId: !Ref ServiceSg
+  ServiceFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServiceSg
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8081
+      SourceSecurityGroupId: !Ref AlbSg
+
+  # ───────────── GPU hosts: fixed fleet, ASG replaces a killed host immediately ─────────────
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "exam-r${RunId}-cluster"
+      ClusterSettings:
+        - {Name: containerInsights, Value: enabled}
+  HostTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "exam-r${RunId}-gpu"
+      LaunchTemplateData:
+        ImageId: !Ref EcsGpuAmiId
+        InstanceType: g6.xlarge
+        IamInstanceProfile: {Arn: !Ref InstanceProfileArn}
+        SecurityGroupIds: [!Ref HostSg]
+        MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 1}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: 100, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat >> /etc/ecs/ecs.config <<EOF
+            ECS_CLUSTER=exam-r${RunId}-cluster
+            ECS_ENABLE_GPU_SUPPORT=true
+            ECS_AWSVPC_BLOCK_IMDS=true
+            ECS_DISABLE_PRIVILEGED=true
+            ECS_IMAGE_PULL_BEHAVIOR=prefer-cached
+            ECS_CONTAINER_STOP_TIMEOUT=10s
+            EOF
+  HostGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "exam-r${RunId}-gpu"
+      MinSize: !Ref GpuCount
+      MaxSize: !Ref GpuCount
+      DesiredCapacity: !Ref GpuCount
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 60
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref HostTemplate
+        Version: !GetAtt HostTemplate.LatestVersionNumber
+  HostCapacity:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub "exam-r${RunId}-gpu"
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref HostGroup
+        ManagedTerminationProtection: DISABLED
+        ManagedScaling: {Status: DISABLED}
+  ClusterCapacity:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders: [!Ref HostCapacity]
+      DefaultCapacityProviderStrategy:
+        - {CapacityProvider: !Ref HostCapacity, Weight: 1}
+
+  # ───────────── Task: admission sidecar (8081) -> reference inference (8080, 1 GPU) ─────────────
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/exam-run/r${RunId}/inference"
+      RetentionInDays: 7
+  Task:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "exam-r${RunId}-inference"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "3584"
+      Memory: "12288"
+      ExecutionRoleArn: !Ref TaskExecutionRoleArn
+      ContainerDefinitions:
+        - Name: inference
+          Image: !Ref ReferenceImageUri
+          Essential: true
+          User: "10001"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          PortMappings: [{ContainerPort: 8080, Protocol: tcp}]
+          ResourceRequirements: [{Type: GPU, Value: "1"}]
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: {Drop: [ALL]}
+            SharedMemorySize: 1024
+            Tmpfs: [{ContainerPath: /tmp, Size: 2048, MountOptions: [rw, nosuid, nodev]}]
+          HealthCheck:
+            Command: [CMD-SHELL, "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=3)\""]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 300
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: inference
+        # Admission control. If the server queues without limit, an open-loop load above the reference
+        # image's ~2 req/s turns into a backlog where every answer arrives after the 10 s limit. HAProxy keeps at most
+        # BackendMaxConn requests at the GPU, waits QueueTimeoutMs at most, and answers 503 at once otherwise:
+        # throughput stays at full GPU capacity and successful requests stay ~0.5-2 s.
+        - Name: admission
+          Image: !Ref ImageHaproxy
+          Essential: true
+          User: "99"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          Cpu: 512
+          MemoryReservation: 256
+          PortMappings: [{ContainerPort: 8081, Protocol: tcp}]
+          Ulimits: [{Name: nofile, SoftLimit: 65536, HardLimit: 65536}]
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: {Drop: [ALL]}
+            Tmpfs: [{ContainerPath: /tmp, Size: 16, MountOptions: [rw, nosuid, nodev, noexec]}]
+          EntryPoint: ["/bin/sh", "-c"]
+          Command: ['printf "%s\n" "$HAPROXY_CFG" > /tmp/haproxy.cfg && exec haproxy -db -f /tmp/haproxy.cfg']
+          Environment:
+            - Name: HAPROXY_CFG
+              Value: !Sub |
+                global
+                  maxconn 20000
+                  log stdout format raw local0 info
+                defaults
+                  mode http
+                  log global
+                  option dontlognull
+                  timeout connect 2s
+                  timeout http-request 10s
+                  timeout client 75s
+                  timeout http-keep-alive 75s
+                  timeout server 9s
+                  timeout queue ${QueueTimeoutMs}ms
+                frontend fe
+                  bind :8081
+                  maxconn 20000
+                  option httplog
+                  http-request set-log-level silent if { path /health }
+                  http-after-response set-log-level silent if { status 503 } !{ rand(100) lt 1 }
+                  acl is_health path /health
+                  use_backend be_health if is_health
+                  default_backend be_infer
+                backend be_health
+                  timeout server 4s
+                  server app 127.0.0.1:8080
+                backend be_infer
+                  http-reuse always
+                  server app 127.0.0.1:8080 maxconn ${BackendMaxConn} maxqueue 4
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: admission
+
+  # ───────────── Entry point ─────────────
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "exam-r${RunId}-alb"
+      Scheme: internal
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSg]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: "60"}
+  Targets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "exam-r${RunId}-tg"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8081
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 5
+      HealthCheckTimeoutSeconds: 4
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "10"}
+        - {Key: load_balancing.algorithm.type, Value: least_outstanding_requests}
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref Targets}
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, ClusterCapacity]
+    Properties:
+      ServiceName: !Sub "exam-r${RunId}-inference"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref Task
+      DesiredCount: !Ref GpuCount
+      HealthCheckGracePeriodSeconds: 300
+      CapacityProviderStrategy:
+        - {CapacityProvider: !Ref HostCapacity, Weight: 1}
+      PlacementStrategies:
+        - {Type: spread, Field: "attribute:ecs.availability-zone"}
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref ServiceSg]
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - {ContainerName: admission, ContainerPort: 8081, TargetGroupArn: !Ref Targets}
+
+  # ───────────── Observability ─────────────
+  UnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-unhealthy-targets"
+      AlarmDescription: A GPU task stopped answering /health (host loss or model crash).
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt Targets.TargetGroupFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  ElbErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-elb-5xx"
+      AlarmDescription: The ALB itself failed requests (no healthy target, connection errors).
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  ShedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-overload-shed"
+      AlarmDescription: Admission sidecar is shedding (demand above GPU capacity).
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-latency-p95"
+      AlarmDescription: p95 target response time above 5 s (half of the client timeout).
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      ExtendedStatistic: p95
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "exam-r${RunId}-overview"
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Requests / 2xx / shed(target 5xx) / ELB 5xx", "stat": "Sum", "period": 60,
+            "metrics": [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
+                        ["AWS/ApplicationELB", "HTTPCode_Target_2XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
+                        ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
+                        ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Target response time p50 / p95 / p99", "period": 60,
+            "metrics": [["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${Alb.LoadBalancerFullName}", {"stat": "p50"}],
+                        ["...", {"stat": "p95"}],
+                        ["...", {"stat": "p99"}]]}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "Healthy / unhealthy targets", "stat": "Maximum", "period": 60,
+            "metrics": [["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}"],
+                        ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${Targets.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}"]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {"region": "${AWS::Region}", "title": "GPU hosts in service", "stat": "Maximum", "period": 60,
+            "metrics": [["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "exam-r${RunId}-gpu"]]}}
+        ]}
+
+Outputs:
+  EndpointUrl:
+    Value: !Sub "http://${Alb.DNSName}"
