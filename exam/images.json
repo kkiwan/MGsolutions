@@ -1,1 +1,1 @@
-{"Haproxy": "docker.io/library/haproxy:3.0-alpine", "Pose": "ghcr.io/OWNER/pose3d-server:latest"}
+{"Haproxy": "docker.io/library/haproxy:3.0-alpine"}
