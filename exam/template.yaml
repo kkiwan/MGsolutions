@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  r1 safe baseline - internal ALB -> ECS(EC2 g6.xlarge x8) task = HAProxy admission sidecar + reference inference.
-  Fixed fleet at the GPU cap (8) because peak demand exceeds 8 GPUs at every stage from 2 upward;
-  the sidecar bounds per-GPU queueing so overload never turns into a backlog collapse.
+  r2 - internal ALB -> ECS(EC2 g6.2xlarge, 2..8) task = HAProxy admission sidecar + batched fp16 inference server
+  (self-verified at boot against embedded practice answers, falls back to fp32 when it does not match).
+  Fleet: 2 GPUs while traffic is light, all 8 as soon as traffic passes 600 req/min, back to 2 when it drops.
 
 Parameters:
   # ---- platform parameters (passed by the exam) ----
@@ -17,19 +17,36 @@ Parameters:
   ReferenceImageUri: {Type: String}
   EcsGpuAmiId: {Type: "AWS::EC2::Image::Id"}
   ImageHaproxy: {Type: String}
+  ImagePose: {Type: String}
   # ---- tuning knobs (defaults are the submitted values) ----
-  GpuCount:
-    Type: Number
-    Default: 8
-    Description: GPU hosts = inference tasks (1 GPU per task). Exam cap is 8.
-  BackendMaxConn:
+  GpuMin:
     Type: Number
     Default: 2
-    Description: Requests in flight to the inference container (1 running + 1 ready).
+    Description: GPU hosts while traffic is light (one per AZ, survives the loss of one host).
+  GpuMax:
+    Type: Number
+    Default: 8
+    Description: GPU hosts under load (exam cap 8). 1 GPU per task.
+  ScaleOutPerMin:
+    Type: Number
+    Default: 600
+    Description: ALB requests per minute that switch the fleet to GpuMax (stage 2 sends 1,000/min).
+  ScaleInPerMin:
+    Type: Number
+    Default: 300
+    Description: ALB requests per minute below which the fleet returns to GpuMin (idle tail sends 100/min).
+  MaxBatch:
+    Type: Number
+    Default: 16
+    Description: Largest GPU batch (batch 16 matched the reference answers 100% in the reference measurements).
+  BackendMaxConn:
+    Type: Number
+    Default: 64
+    Description: Requests in flight to the inference server (about 4 batches - running, prepared, forming, next).
   QueueTimeoutMs:
     Type: Number
-    Default: 1000
-    Description: Max wait in the sidecar queue before a fast 503 (keeps total latency far below the 10 s limit).
+    Default: 200
+    Description: Max wait in the sidecar queue before a fast 503 (overload is answered at once, successes stay fast).
 
 Resources:
   # ───────────── Security groups: client -> ALB(80) -> sidecar(8081). Hosts reach AWS endpoints only ─────────────
@@ -88,7 +105,7 @@ Resources:
       LaunchTemplateName: !Sub "exam-r${RunId}-gpu"
       LaunchTemplateData:
         ImageId: !Ref EcsGpuAmiId
-        InstanceType: g6.xlarge
+        InstanceType: g6.2xlarge
         IamInstanceProfile: {Arn: !Ref InstanceProfileArn}
         SecurityGroupIds: [!Ref HostSg]
         MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 1}
@@ -110,9 +127,10 @@ Resources:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
       AutoScalingGroupName: !Sub "exam-r${RunId}-gpu"
-      MinSize: !Ref GpuCount
-      MaxSize: !Ref GpuCount
-      DesiredCapacity: !Ref GpuCount
+      MinSize: !Ref GpuMin
+      MaxSize: !Ref GpuMax
+      DesiredCapacity: !Ref GpuMin
+      TerminationPolicies: [NewestInstance]
       HealthCheckType: EC2
       HealthCheckGracePeriod: 60
       VPCZoneIdentifier: !Ref SubnetIds
@@ -147,14 +165,21 @@ Resources:
       Family: !Sub "exam-r${RunId}-inference"
       NetworkMode: awsvpc
       RequiresCompatibilities: [EC2]
-      Cpu: "3584"
-      Memory: "12288"
+      Cpu: "7680"
+      Memory: "28672"
       ExecutionRoleArn: !Ref TaskExecutionRoleArn
       ContainerDefinitions:
         - Name: inference
-          Image: !Ref ReferenceImageUri
+          Image: !Ref ImagePose
           Essential: true
           User: "10001"
+          Environment:
+            - {Name: DEVICE, Value: "cuda:0"}
+            - {Name: PRECISION, Value: auto}
+            - {Name: MAX_BATCH, Value: !Ref MaxBatch}
+            - {Name: PREP_THREADS, Value: "6"}
+            - {Name: STALE_MS, Value: "3000"}
+            - {Name: SELFTEST_NEED, Value: "0.96"}
           ReadonlyRootFilesystem: true
           Privileged: false
           PortMappings: [{ContainerPort: 8080, Protocol: tcp}]
@@ -162,7 +187,7 @@ Resources:
           LinuxParameters:
             InitProcessEnabled: true
             Capabilities: {Drop: [ALL]}
-            SharedMemorySize: 1024
+            SharedMemorySize: 2048
             Tmpfs: [{ContainerPath: /tmp, Size: 2048, MountOptions: [rw, nosuid, nodev]}]
           HealthCheck:
             Command: [CMD-SHELL, "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=3)\""]
@@ -176,10 +201,10 @@ Resources:
               awslogs-group: !Ref Logs
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: inference
-        # Admission control. If the server queues without limit, an open-loop load above the reference
-        # image's ~2 req/s turns into a backlog where every answer arrives after the 10 s limit. HAProxy keeps at most
-        # BackendMaxConn requests at the GPU, waits QueueTimeoutMs at most, and answers 503 at once otherwise:
-        # throughput stays at full GPU capacity and successful requests stay ~0.5-2 s.
+        # Admission control. The load is open-loop, so demand above GPU capacity would otherwise pile up until
+        # every answer is late. HAProxy keeps at most BackendMaxConn requests at the server (enough for full batches),
+        # waits QueueTimeoutMs at most, and answers 503 at once otherwise. r1 measured this: throughput stayed at
+        # full GPU capacity through 36x overload with 0 timeouts.
         - Name: admission
           Image: !Ref ImageHaproxy
           Essential: true
@@ -226,7 +251,7 @@ Resources:
                   server app 127.0.0.1:8080
                 backend be_infer
                   http-reuse always
-                  server app 127.0.0.1:8080 maxconn ${BackendMaxConn} maxqueue 4
+                  server app 127.0.0.1:8080 maxconn ${BackendMaxConn} maxqueue ${BackendMaxConn}
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -276,7 +301,7 @@ Resources:
       ServiceName: !Sub "exam-r${RunId}-inference"
       Cluster: !Ref Cluster
       TaskDefinition: !Ref Task
-      DesiredCount: !Ref GpuCount
+      DesiredCount: !Ref GpuMin
       HealthCheckGracePeriodSeconds: 300
       CapacityProviderStrategy:
         - {CapacityProvider: !Ref HostCapacity, Weight: 1}
@@ -293,6 +318,91 @@ Resources:
           AssignPublicIp: DISABLED
       LoadBalancers:
         - {ContainerName: admission, ContainerPort: 8081, TargetGroupArn: !Ref Targets}
+
+  # ───────────── Scaling: two states driven by ALB request rate ─────────────
+  # Light (warm-up, stage 1, idle tail ~100/min) -> GpuMin. Loaded (stage 2+ >= 1,000/min) -> GpuMax at once.
+  # Exact-capacity steps instead of target tracking: every stage from 3 up exceeds 8 GPUs, so "all 8 now" is the
+  # right answer and saves the minutes a gradual ramp would lose. Hosts (ASG) and tasks (ECS) move together.
+  TaskScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub "service/${Cluster}/${Service.Name}"
+      MinCapacity: !Ref GpuMin
+      MaxCapacity: !Ref GpuMax
+  TaskScaleOut:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "exam-r${RunId}-tasks-out"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref TaskScaling
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        Cooldown: 30
+        MetricAggregationType: Maximum
+        StepAdjustments: [{MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref GpuMax}]
+  TaskScaleIn:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "exam-r${RunId}-tasks-in"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref TaskScaling
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        Cooldown: 30
+        MetricAggregationType: Maximum
+        StepAdjustments: [{MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref GpuMin}]
+  HostScaleOut:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref HostGroup
+      PolicyType: StepScaling
+      AdjustmentType: ExactCapacity
+      MetricAggregationType: Maximum
+      EstimatedInstanceWarmup: 60
+      StepAdjustments: [{MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref GpuMax}]
+  HostScaleIn:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref HostGroup
+      PolicyType: StepScaling
+      AdjustmentType: ExactCapacity
+      MetricAggregationType: Maximum
+      EstimatedInstanceWarmup: 60
+      StepAdjustments: [{MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref GpuMin}]
+  TrafficHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-traffic-high"
+      AlarmDescription: Load stage 2+ - run every GPU.
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref ScaleOutPerMin
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TaskScaleOut, !Ref HostScaleOut]
+  TrafficLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "exam-r${RunId}-traffic-low"
+      AlarmDescription: Light traffic - keep only the minimum fleet.
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref ScaleInPerMin
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TaskScaleIn, !Ref HostScaleIn]
 
   # ───────────── Observability ─────────────
   UnhealthyAlarm:
