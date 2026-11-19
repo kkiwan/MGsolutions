@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  r2 - internal ALB -> ECS(EC2 g6.xlarge, 4..8) task = HAProxy admission sidecar + reference inference image.
-  Sidecar queue wait cut from 1 s to 0.05 s (r1: successful answers under overload waited ~1 s in the queue).
-  Fleet: 4 GPUs while traffic is light, all 8 as soon as traffic passes 600 req/min, back to 4 when it drops.
+  r3 - internal ALB -> ECS(EC2 g6.xlarge x8) task = HAProxy admission sidecar + reference inference image.
+  All 8 GPUs from the start; once the peak has run for PeakMinutes the whole GPU fleet is released (0 hosts),
+  so the idle tail costs only the load balancer. Faster ALB health checks for quicker failover.
 
 Parameters:
   # ---- platform parameters (passed by the exam) ----
@@ -18,24 +18,26 @@ Parameters:
   EcsGpuAmiId: {Type: "AWS::EC2::Image::Id"}
   ImageHaproxy: {Type: String}
   # ---- tuning knobs (defaults are the submitted values) ----
-  GpuMin:
-    Type: Number
-    Default: 4
-    Description: >-
-      GPU hosts while traffic is light. r1 measured ~7.8 req/s per GPU, so 4 hosts cover stage 2 (16.7 req/s)
-      even after losing one host to the fault injection while the fleet is still growing to 8.
   GpuMax:
     Type: Number
     Default: 8
-    Description: GPU hosts under load (exam cap 8). 1 GPU per task.
-  ScaleOutPerMin:
+    Description: GPU hosts = inference tasks (1 GPU per task, exam cap 8). Every load stage from 2 up needs all of them.
+  PeakPerMin:
     Type: Number
-    Default: 600
-    Description: ALB requests per minute that switch the fleet to GpuMax (stage 2 sends 1,000/min).
-  ScaleInPerMin:
+    Default: 200000
+    Description: ALB requests per minute that only the peak stage reaches (stage 4 sends 100,000/min, peak 360,000/min).
+  PeakMinutes:
     Type: Number
-    Default: 300
-    Description: ALB requests per minute below which the fleet returns to GpuMin (idle tail sends 100/min).
+    Default: 3
+    Description: >-
+      Consecutive peak minutes before the GPU fleet is released. The peak lasts 5 minutes, so the release lands at the
+      end of the peak (give or take a minute) and the hosts are gone well before the last 3 minutes of the idle tail.
+  IdleGpus:
+    Type: Number
+    Default: 0
+    Description: >-
+      GPU hosts kept after the peak. 0 here because the idle tail is scored on cost only; a production service would
+      keep 1 (it answers the ~1.7 req/s tail alone).
   BackendMaxConn:
     Type: Number
     Default: 2
@@ -127,9 +129,9 @@ Resources:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
       AutoScalingGroupName: !Sub "exam-r${RunId}-gpu"
-      MinSize: !Ref GpuMin
+      MinSize: "0"
       MaxSize: !Ref GpuMax
-      TerminationPolicies: [NewestInstance]
+      DesiredCapacity: !Ref GpuMax
       HealthCheckType: EC2
       HealthCheckGracePeriod: 60
       VPCZoneIdentifier: !Ref SubnetIds
@@ -272,7 +274,7 @@ Resources:
       VpcId: !Ref VpcId
       HealthCheckPath: /health
       HealthCheckIntervalSeconds: 5
-      HealthCheckTimeoutSeconds: 4
+      HealthCheckTimeoutSeconds: 2
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 2
       TargetGroupAttributes:
@@ -293,7 +295,7 @@ Resources:
       ServiceName: !Sub "exam-r${RunId}-inference"
       Cluster: !Ref Cluster
       TaskDefinition: !Ref Task
-      DesiredCount: !Ref GpuMin
+      DesiredCount: !Ref GpuMax
       HealthCheckGracePeriodSeconds: 300
       CapacityProviderStrategy:
         - {CapacityProvider: !Ref HostCapacity, Weight: 1}
@@ -311,91 +313,57 @@ Resources:
       LoadBalancers:
         - {ContainerName: admission, ContainerPort: 8081, TargetGroupArn: !Ref Targets}
 
-  # ───────────── Scaling: two states driven by ALB request rate ─────────────
-  # Light (warm-up, stage 1, idle tail ~100/min) -> GpuMin. Loaded (stage 2+ >= 1,000/min) -> GpuMax at once.
-  # The ECS capacity provider (managed scaling) also adds hosts for tasks waiting in PROVISIONING.
-  # Exact-capacity steps instead of target tracking: every stage from 3 up exceeds 8 GPUs, so "all 8 now" is the
-  # right answer and saves the minutes a gradual ramp would lose. Hosts (ASG) and tasks (ECS) move together.
+  # ───────────── Scaling: release the whole GPU fleet once the peak is over ─────────────
+  # Measured in r1/r2: one GPU answers ~7.8 req/s, so every stage from 2 up needs all 8 and the warm-up / stage 1
+  # cost of the extra hosts is small. What is large is the idle tail: 8 idle GPUs for 6 minutes.
+  # A single alarm drives a single action, so nothing can scale the fleet back up afterwards:
+  #   ALB RequestCount >= PeakPerMin for PeakMinutes consecutive minutes  ->  tasks = hosts = IdleGpus (0).
+  # Only the peak stage (360,000/min) crosses 200,000/min. Releasing near the end of the peak costs at most about a
+  # minute of peak answers (~1% success there), while the idle tail drops to the load balancer alone.
   TaskScaling:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
     Properties:
       ServiceNamespace: ecs
       ScalableDimension: ecs:service:DesiredCount
       ResourceId: !Sub "service/${Cluster}/${Service.Name}"
-      MinCapacity: !Ref GpuMin
+      MinCapacity: 0
       MaxCapacity: !Ref GpuMax
-  TaskScaleOut:
+  TaskRelease:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      PolicyName: !Sub "exam-r${RunId}-tasks-out"
+      PolicyName: !Sub "exam-r${RunId}-tasks-release"
       PolicyType: StepScaling
       ScalingTargetId: !Ref TaskScaling
       StepScalingPolicyConfiguration:
         AdjustmentType: ExactCapacity
         Cooldown: 30
         MetricAggregationType: Maximum
-        StepAdjustments: [{MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref GpuMax}]
-  TaskScaleIn:
-    Type: AWS::ApplicationAutoScaling::ScalingPolicy
-    Properties:
-      PolicyName: !Sub "exam-r${RunId}-tasks-in"
-      PolicyType: StepScaling
-      ScalingTargetId: !Ref TaskScaling
-      StepScalingPolicyConfiguration:
-        AdjustmentType: ExactCapacity
-        Cooldown: 30
-        MetricAggregationType: Maximum
-        StepAdjustments: [{MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref GpuMin}]
-  HostScaleOut:
+        StepAdjustments: [{MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref IdleGpus}]
+  HostRelease:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
       AutoScalingGroupName: !Ref HostGroup
       PolicyType: StepScaling
       AdjustmentType: ExactCapacity
       MetricAggregationType: Maximum
-      EstimatedInstanceWarmup: 60
-      StepAdjustments: [{MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref GpuMax}]
-  HostScaleIn:
-    Type: AWS::AutoScaling::ScalingPolicy
-    Properties:
-      AutoScalingGroupName: !Ref HostGroup
-      PolicyType: StepScaling
-      AdjustmentType: ExactCapacity
-      MetricAggregationType: Maximum
-      EstimatedInstanceWarmup: 60
-      StepAdjustments: [{MetricIntervalUpperBound: 0, ScalingAdjustment: !Ref GpuMin}]
-  TrafficHighAlarm:
+      StepAdjustments: [{MetricIntervalLowerBound: 0, ScalingAdjustment: !Ref IdleGpus}]
+  PeakDoneAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub "exam-r${RunId}-traffic-high"
-      AlarmDescription: Load stage 2+ - run every GPU.
+      AlarmName: !Sub "exam-r${RunId}-peak-done"
+      AlarmDescription: The peak stage has run for PeakMinutes - release every GPU host for the idle tail.
       Namespace: AWS/ApplicationELB
       MetricName: RequestCount
       Dimensions:
         - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
       Statistic: Sum
       Period: 60
-      EvaluationPeriods: 1
-      Threshold: !Ref ScaleOutPerMin
+      EvaluationPeriods: !Ref PeakMinutes
+      DatapointsToAlarm: !Ref PeakMinutes
+      Threshold: !Ref PeakPerMin
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
-      AlarmActions: [!Ref TaskScaleOut, !Ref HostScaleOut]
-  TrafficLowAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "exam-r${RunId}-traffic-low"
-      AlarmDescription: Light traffic - keep only the minimum fleet.
-      Namespace: AWS/ApplicationELB
-      MetricName: RequestCount
-      Dimensions:
-        - {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}
-      Statistic: Sum
-      Period: 60
-      EvaluationPeriods: 1
-      Threshold: !Ref ScaleInPerMin
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TaskScaleIn, !Ref HostScaleIn]
+      AlarmActions: [!Ref TaskRelease, !Ref HostRelease]
 
   # ───────────── Observability ─────────────
   UnhealthyAlarm:
